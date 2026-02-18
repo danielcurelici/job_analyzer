@@ -315,3 +315,5 @@ with tab2:
                 
                 # Grafic simplu
                 st.bar_chart(df['Seniority'].value_counts())
+
+                print()
