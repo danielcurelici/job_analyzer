@@ -1,3 +1,4 @@
+from openai import OpenAI
 import streamlit as st
 import os
 import re
@@ -10,6 +11,9 @@ import instructor
 from groq import Groq
 from dotenv import load_dotenv
 import json
+from pydantic import ValidationError
+import traceback
+
 
 SENIORITY_MAPPING = {
     # INTERN
@@ -62,20 +66,27 @@ st.set_page_config(page_title="GenAI Headhunter", page_icon="🕵️", layout="w
 load_dotenv()
 
 # Încercăm să luăm cheia din OS (local) sau din Streamlit Secrets (cloud)
-api_key = os.getenv("GROQ_API_KEY")
+groq_api_key = os.getenv("GROQ_API_KEY")
+op_api_key = os.getenv("OPENROUTER_API_KEY")
 
 # Fallback pentru Streamlit Cloud deployment
-if not api_key and "GROQ_API_KEY" in st.secrets:
-    api_key = st.secrets["GROQ_API_KEY"]
+if not groq_api_key and "GROQ_API_KEY" in st.secrets:
+    groq_api_key = st.secrets["GROQ_API_KEY"]
+
+if not op_api_key and "OPENROUTER_API_KEY" in st.secrets:
+    op_api_key = st.secrets["OPENROUTER_API_KEY"]
+
 
 # Validare critică: Dacă nu avem cheie, oprim aplicația aici.
-if not api_key:
-    st.error("⛔ EROARE CRITICĂ: Lipsește `GROQ_API_KEY`.")
-    st.info("Te rog creează un fișier `.env` în folderul proiectului și adaugă: GROQ_API_KEY=cheia_ta_aici")
+if not groq_api_key or not op_api_key:
+    st.error("⛔ EROARE CRITICĂ: Lipsește `GROQ_API_KEY` sau `OPENROUTER_API_KEY`.")
+    st.info("Te rog creează un fișier `.env` în folderul proiectului și adaugă: GROQ_API_KEY=cheia_ta_aici și OPENROUTER_API_KEY=cheia_ta_aici")
     st.stop()
 
 # Configurare Client Groq Global (pentru a nu-l reinițializa constant)
-client = instructor.from_groq(Groq(api_key=api_key), mode=instructor.Mode.TOOLS)
+groq_client = instructor.from_groq(Groq(api_key=groq_api_key), mode=instructor.Mode.JSON)
+op_client = instructor.from_openai(OpenAI(api_key=op_api_key, base_url="https://openrouter.ai/api/v1"), mode=instructor.Mode.JSON)
+
 
 # Sidebar Informativ (Fără input de date sensibile)
 with st.sidebar:
@@ -96,11 +107,11 @@ class Location(BaseModel):
     country: Optional[str] = Field(None, description="Țara")
 
 class Red_flags(BaseModel):
-    severity: Literal["low", "medium", "high"] = Field(None, description="Nivelul de severitate al semnalului (ex: low, medium, high)")    
-    category: Literal["toxicity", "vagueness", "unrealistic", "stress"] = Field(None, description="Categoria semnalului de alarmă, Poate inseamnă că anunțul este neclar, ambiguu sau generic. Sau inseamnă că cerințele sau oferta sunt nerealiste sau disproporționate.")
+    severity: Optional[Literal["low", "medium", "high"]] = Field(None, description="Nivelul de severitate al semnalului (ex: low, medium, high)")    
+    category: Optional[Literal["toxicity", "vagueness", "unrealistic", "stress"]] = Field(None, description="Categoria semnalului de alarmă, Poate inseamnă că anunțul este neclar, ambiguu sau generic. Sau inseamnă că cerințele sau oferta sunt nerealiste sau disproporționate.")
   
 
-class JobAnalysis(BaseModel):
+class RawExtraction(BaseModel):
     role_title: str = Field(..., description="Titlul jobului standardizat")
     company_name: str = Field(..., description="Numele companiei")
     
@@ -119,7 +130,10 @@ class JobAnalysis(BaseModel):
     red_flags: List[Red_flags] = Field(..., description="Lista de semnale de alarmă (toxicitate, stres, vaguitate)")
     summary: str = Field(..., description="Un rezumat scurt al rolului (max 2 fraze) în limba română")
     is_remote: bool = Field(False, description="True dacă jobul este remote sau hibrid")
-    SalaryRange: Optional[str] = Field(min_sal = 500, max_sal = 5000, currency = "EUR", description="Interval salarial dacă este menționat (ex: 1000-5000 EUR)")
+    SalaryRange: Optional[str] = Field(
+        default=None, 
+        description='Interval salarial dacă este menționat (ex: "1000-5000 EUR")',
+        json_schema_extra={"min_sal": 500, "max_sal": 5000, "currency": "EUR"},)
     location: Optional[Location] = Field(None, description="Locația fizică a jobului dacă este specificată (ex: București, Cluj, etc.)")  
 
 
@@ -127,6 +141,30 @@ class JobAnalysis(BaseModel):
     @property
     def is_hybrid(self) -> bool:
         return self.is_remote and self.location is not None 
+
+class FieldValidation(BaseModel):
+    field: str
+    status: Literal["ok", "warning", "error"]
+    issues: List[str] = Field(default_factory=list)
+
+
+class ValidationReport(BaseModel):
+    fields: List[FieldValidation]
+    overall_status: Literal["consistent", "minor_issues", "inconsistent"]
+    confidence: int = Field(..., ge=0, le=100)
+
+class StrategicAdvice(BaseModel):
+    # 1️⃣ Potrivire cu piața (RO)
+    market_fit_summary: str = Field(..., description="Evaluare neutră a anunțului: cât de bine se aliniază cu piața IT din România și unde poate fi îmbunătățit.")
+    market_improvements_for_hr: List[str] = Field(default_factory=list, description="Sugestii concrete pentru HR ca să facă anunțul mai competitiv/clar (ex: claritate rol, cerințe, beneficii, limbaj).")
+    
+    # 2️⃣ Întrebări pentru formular de pre-screening (către candidat)
+    pre_screening_form_knockout_questions: List[str] = Field(default_factory=list, description="Întrebări eliminatorii/scurte pentru formular (eligibility, disponibilitate, cerințe must-have, salariu, remote/hybrid).")
+    pre_screening_form_technical_questions: List[str] = Field(default_factory=list, description="Întrebări tehnice pentru formular (răspuns scurt/multiple-choice) bazate pe cerințele din anunț.")
+    pre_screening_form_behavioral_questions: List[str] = Field(default_factory=list, description="Întrebări comportamentale pentru formular (răspuns scurt) relevante pentru rol.")
+    
+    # 3️⃣ Negociere salariu (către HR)
+    salary_negotiation_tips_for_hr: List[str] = Field(default_factory=list, description="Recomandări pentru HR: cum să poziționeze oferta, ce să clarifice, ce compromisuri sunt uzuale în România.")
 
 # ==============================================================================
 # 3. UTILS - SCRAPER (Colectare Date)
@@ -163,18 +201,20 @@ def scrape_clean_job_text(url: str, max_chars: int = 3000) -> str:
 # 4. AI SERVICE LAYER (Logica LLM)
 # ==============================================================================
 
-def analyze_job_with_ai(text: str) -> JobAnalysis:
+def extract_job_with_ai(text: str) -> RawExtraction:
     """
     Trimite textul curățat către Groq și returnează obiectul structurat.
     """
-    return client.chat.completions.create(
+    try:
+        return groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        response_model=JobAnalysis,
+        response_model=RawExtraction,
+        response_format={"type": "json_object"},
         messages=[
             {
                 "role": "system", 
                 "content": (
-                    "Ești un Recruiter Expert în IT. Analizează textul jobului cu obiectivitate. "
+                    "Ești un Recruiter Expert în IT din România care lucrează într-o firmă de headhunting. "
                     "Identifică tehnologiile și potențialele probleme (red flags). "
                     "Răspunde strict în formatul cerut."
                 )
@@ -184,9 +224,111 @@ def analyze_job_with_ai(text: str) -> JobAnalysis:
                 "content": f"Analizează acest job description:\n\n{text}"
             }
         ],
-        temperature=0.1,
+        max_retries=2,
+        temperature=0,
     )
+    except ValidationError as ve:
+        st.error("ValidationError (RawExtraction)")
+        st.json(ve.errors())
+        raise
 
+    except Exception:
+        st.error("Eroare neașteptată (Extractor)")
+        st.code(traceback.format_exc())
+        raise
+def validate_extraction_with_ai(original_text: str, extraction: RawExtraction) -> ValidationReport:
+    """
+    Agent 3: The Validator
+    Verifică consistența dintre textul original și output-ul Extractorului.
+    """
+
+    try:
+        return groq_client.chat.completions.create(
+        model="moonshotai/kimi-k2-instruct-0905",
+        response_model=ValidationReport,
+        response_format={"type": "json_object"},
+        temperature=0,
+        max_retries=2,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Ești 'The Validator' într-un pipeline AI cu 3 agenți: Extractor, Validator, Counselor.\n\n"
+                    "Rolul tău este să verifici CONSISTENȚA dintre textul original al jobului și JSON-ul extras.\n"
+                    "Pentru fiecare câmp relevant (role_title, company_name, seniority, tech_stack, "
+                    "is_remote, location, SalaryRange, summary, red_flags):\n"
+                    "- Marchează status = 'ok' dacă este consistent.\n"
+                    "- Marchează status = 'warning' dacă este parțial ambiguu.\n"
+                    "- Marchează status = 'error' dacă este greșit sau inventat.\n\n"
+                    "Adaugă issues DOAR dacă există probleme reale.\n"
+                    "Nu inventa informații.\n"
+                    "Returnează STRICT un ValidationReport valid JSON."
+                )
+            },
+            {
+                "role": "user",
+                "content": (
+                    "TEXT ORIGINAL:\n"
+                    f"{original_text}\n\n"
+                    "JSON EXTRAS:\n"
+                    f"{extraction.model_dump_json(indent=2)}"
+                )
+            }
+        ]
+        
+    )
+    except ValidationError as ve:
+        st.error("ValidationError (ValidationReport)")
+        st.json(ve.errors())
+        raise
+
+    except Exception:
+        st.error("Eroare neașteptată (Validator)")
+        st.code(traceback.format_exc())
+        raise
+
+def strategic_advice_with_ai(extraction: RawExtraction) -> StrategicAdvice:
+    try:
+        return groq_client.chat.completions.create(
+            model="groq/compound",  
+            response_model=StrategicAdvice,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ești un Recruiter Expert în IT din România care lucrează într-o firmă de headhunting. "
+                        "Analizezi anunțurile postate de HR cu scopul de a le îmbunătăți. "
+                        "Returnează STRICT JSON valid care respectă schema StrategicAdvice. "
+                        "Fără text în plus, fără markdown."
+                        "Structură în 3 categorii: "
+                        "1) potrivire a anunțului cu piața din România (și îmbunătățiri pentru HR), "
+                        "2) întrebări pentru un formular de pre-screening completat de candidat (knockout + tehnic + comportamental), "
+                        "3) recomandări pentru negociere salarială adresate HR."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Generează analiza pe baza acestui JSON:\n\n"
+                        f"{extraction.model_dump_json(indent=2)}"
+                    ),
+                },
+            ],
+            max_retries=2,
+            temperature=0.7
+        )
+
+    except ValidationError as ve:
+        st.error("ValidationError (StrategicAdvice)")
+        st.json(ve.errors())  # aici vezi exact câmpul care lipsește / e greșit
+        raise
+
+    except Exception as e:
+        st.error("Eroare neașteptată: Counselor")
+        st.code(traceback.format_exc())
+        raise
+    
 # ==============================================================================
 # 5. UI - APLICAȚIA STREAMLIT
 # ==============================================================================
@@ -213,21 +355,44 @@ with tab1:
                 st.error(raw_text)
             else:
                 try:
-                    data = analyze_job_with_ai(raw_text)
-                    st.json(data)  # PRINT
+                    data = extract_job_with_ai(raw_text)
+                    # st.json(data)  # PRINT
+                    validation = validate_extraction_with_ai(raw_text, data)
+                    #st.json(validation)  # PRINT
+                    
+                    if validation.overall_status == "inconsistent":
+                        st.warning("⚠️ Validator a detectat inconsistențe. Se încearcă re-extragerea automată...")
+
+                        # Retry extraction
+                        data = extract_job_with_ai(raw_text)
+                        validation = validate_extraction_with_ai(raw_text, data)
+
+                        # Dacă tot e inconsistent după retry
+                        if validation.overall_status == "inconsistent":
+                            st.error("❌ Extraction rămâne inconsistentă după retry. Insight-urile pot fi afectate.")
+
+                    elif validation.overall_status == "minor_issues":
+                        st.info("ℹ️ Extraction are mici ambiguități.")
+
+
+                    strategic_data = strategic_advice_with_ai(validation)
+                    # st.json(strategic_data)  # PRINT
+
                     # -- DISPLAY --
                     st.divider()
-                    col_h1, col_h2 = st.columns([3, 1])
+                    col_h1, col_h2, col_h3 = st.columns([3, 2, 1])
                     with col_h1:
                         st.markdown(f"### {data.role_title}")
                         st.caption(f"Companie: **{data.company_name}** | Nivel: **{data.seniority}**")
                     with col_h2:
+                        color = "normal" if validation.confidence > 70 else "inverse"
+                        st.metric("Calitate AI", f"{validation.confidence}/100", delta_color=color)                    
+                    with col_h3:
                         color = "normal" if data.match_score > 70 else "inverse"
-                        st.metric("Quality Score", f"{data.match_score}/100", delta_color=color)
+                        st.metric("Calitate anunt", f"{data.match_score}/100", delta_color=color)
 
-                    # Detalii
-                    c1, c2, c3 = st.columns(3)
 
+                
                     location_text = "N/A"
 
                     if data.location:
@@ -239,36 +404,102 @@ with tab1:
                         if parts:
                             location_text = ", ".join(parts)
 
-                    c1.info(
-                    f"""
-                    **Mod lucru:**  
-                    - Remote: {'Da' if data.is_remote else 'Nu'}  
-                    - Hybrid: {'Da, in locatia de mai jos' if data.is_hybrid else 'Nu'}  
-                    - Locație: {location_text}
-                    """
-)
-                    c2.success(f"**Tehnologii:** {len(data.tech_stack)}")
-                    c3.error(f"**Red Flags:** {len(data.red_flags)}")
-                    c4, c5, c6 = st.columns(3)
-                    c4.info(f"**Interval salarial:** {data.SalaryRange or 'N/A'}")
+                    st.markdown("### 🧩 Overview")
+                    c1, c2, c3 = st.columns([2, 1, 1])
 
+                    with c1:
+                        st.info(
+                            f"""
+                            **Mod lucru**  
+                            - Remote: {'Da' if data.is_remote else 'Nu'}  
+                            - Hybrid: {'Da' if data.is_hybrid else 'Nu'}  
+                            - Locație: {location_text}
+                            """
+                        )
 
-                    st.markdown(f"**📝 Rezumat:** {data.summary}")
-                    st.markdown("#### 🛠️ Tech Stack")
-                    st.write(", ".join([f"`{tech}`" for tech in data.tech_stack]))
+                    with c2:
+                        st.success(f"**Tehnologii**: {len(data.tech_stack)}")
+                        st.info(f"**Interval salarial**: {data.SalaryRange or 'N/A'}")
 
-                    if data.red_flags:
-                        lines = []
-                        for rf in data.red_flags:
-                            if not rf.category:
-                                continue
-                            category_label = rf.category.replace("_", " ").title()
-                            severity_label = (rf.severity or "N/A").title()
-                            lines.append(f"- **{category_label}** — severitate: **{severity_label}**")
+                    with c3:
+                        rf_count = len(data.red_flags)
 
-                        if lines:
-                            st.warning("\n".join(lines))
-                        
+                        if rf_count == 0:
+                            st.success("**Red Flags**: 0")
+                        else:
+                            content = [f"### Red Flags: {rf_count}"]
+
+                            for rf in data.red_flags:
+                                if not rf.category:
+                                    continue
+                                category_label = rf.category.replace("_", " ").title()
+                                severity_label = (rf.severity or "N/A").title()
+                                content.append(f"• **{category_label}** — severitate: **{severity_label}**")
+
+                            st.error("\n\n".join(content))
+
+                    st.markdown("### 🛠️ Tech Stack")
+
+                    if data.tech_stack:
+                        st.markdown(
+                            " ".join(f"`{tech}`" for tech in data.tech_stack)
+                        )
+                    else:
+                        st.caption("N/A")
+
+                    st.markdown(f"**📝 Rezumat job:** {data.summary}")
+                    st.markdown(f"**📝 Aliniere cu piata din Romania:** {strategic_data.market_fit_summary}")
+
+                    st.divider()
+                    st.markdown("## 🧾 Formular pre-screening (pentru candidat)")
+
+                    col1, col2, col3 = st.columns(3)
+
+                    with col1:
+                        st.markdown("### 🚫 Knockout")
+                        qs = strategic_data.pre_screening_form_knockout_questions
+                        if qs:
+                            st.info("\n\n".join(f"**{i+1}.** {q}" for i, q in enumerate(qs)))
+                        else:
+                            st.caption("N/A")
+
+                    with col2:
+                        st.markdown("### 🛠️ Tehnic")
+                        qs = strategic_data.pre_screening_form_technical_questions
+                        if qs:
+                            st.info("\n\n".join(f"**{i+1}.** {q}" for i, q in enumerate(qs)))
+                        else:
+                            st.caption("N/A")
+
+                    with col3:
+                        st.markdown("### 🧠 Comportamental")
+                        qs = strategic_data.pre_screening_form_behavioral_questions
+                        if qs:
+                            st.info("\n\n".join(f"**{i+1}.** {q}" for i, q in enumerate(qs)))
+                        else:
+                            st.caption("N/A")
+
+                    st.divider()
+                    st.markdown("## 🧩 Recomandări pentru HR")
+
+                    col_left, col_right = st.columns(2)
+
+                    with col_left:
+                        st.markdown("### 📈 Îmbunătățiri anunț")
+
+                        imps = strategic_data.market_improvements_for_hr
+                        if imps:
+                            st.info("\n\n".join(f"• {x}" for x in imps))
+                        else:
+                            st.caption("Nu există sugestii.")
+
+                    with col_right:
+                        st.markdown("### 💰 Negociere salarială (HR)")
+                        tips = strategic_data.salary_negotiation_tips_for_hr
+                        if tips:
+                            st.success("\n\n".join(f"• {t}" for t in tips))
+                        else:
+                            st.caption("N/A")
 
                 except Exception as e:
                     st.error(f"Eroare AI: {str(e)}")
@@ -294,7 +525,7 @@ with tab2:
                 
                 if "Error" not in text:
                     try:
-                        res = analyze_job_with_ai(text)
+                        res = extract_job_with_ai(text)
                         results.append({
                             "Role": res.role_title,
                             "Company": res.company_name,
